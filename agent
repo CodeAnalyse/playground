@@ -19,10 +19,11 @@ logger = logging.getLogger(__name__)
 class PowerAgent(BaseAgent):
     system_prompt = (
         "You are a power settlement analyst summarizing power percentage availability "
-        "per market. If no data rows are returned for the requested market and/or date "
-        "range, tell the user clearly and naturally that no power availability data was "
-        "found for their request, and suggest they verify the market name or date range. "
-        "Do not invent data."
+        "per market. For follow-up questions, reuse the most recent market/date filters "
+        "unless the user changes them explicitly. If no data rows are returned for the "
+        "requested market and/or date range, tell the user clearly and naturally that no "
+        "power availability data was found for their request, and suggest they verify the "
+        "market name or date range. Do not invent data."
     )
     tool_names: list[str] = [
         "list_power_availability",
@@ -309,29 +310,66 @@ class PowerAgent(BaseAgent):
 
         return PowerAgent._build_market_html(rows, label)
 
-    def run(self, state: AgentState) -> AgentState:
-        market_name = state.get("MarketName")
-        start_date = state.get("StartDate")
-        end_date = state.get("EndDate")
+    @staticmethod
+    def _normalize_follow_up_value(value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            s = value.strip()
+            if not s:
+                return None
+            if s.lower() in {"all", "all markets", "any", "any market"}:
+                return None
+            return s
+        return value
 
-        if market_name or start_date or end_date:
+    def run(self, state: AgentState) -> AgentState:
+        market_name = self._normalize_follow_up_value(state.get("MarketName"))
+        start_date = self._normalize_follow_up_value(state.get("StartDate"))
+        end_date = self._normalize_follow_up_value(state.get("EndDate"))
+
+        prev_market_name = self._normalize_follow_up_value(state.get("LastMarketName"))
+        prev_start_date = self._normalize_follow_up_value(state.get("LastStartDate"))
+        prev_end_date = self._normalize_follow_up_value(state.get("LastEndDate"))
+
+        resolved_market_name = market_name if market_name is not None else prev_market_name
+        resolved_start_date = start_date if start_date is not None else prev_start_date
+        resolved_end_date = end_date if end_date is not None else prev_end_date
+
+        has_current_filters = any(x is not None for x in (market_name, start_date, end_date))
+        has_resolved_filters = any(x is not None for x in (resolved_market_name, resolved_start_date, resolved_end_date))
+
+        if has_current_filters or has_resolved_filters:
             args = {}
-            if market_name:
-                args["MarketName"] = market_name
-            if start_date:
-                args["StartDate"] = start_date
-            if end_date:
-                args["EndDate"] = end_date
+            if resolved_market_name:
+                args["MarketName"] = resolved_market_name
+            if resolved_start_date:
+                args["StartDate"] = resolved_start_date
+            if resolved_end_date:
+                args["EndDate"] = resolved_end_date
+
+            state["LastMarketName"] = resolved_market_name
+            state["LastStartDate"] = resolved_start_date
+            state["LastEndDate"] = resolved_end_date
 
             return self.answer_with_tool(
                 state,
                 tool_name="get_power_availability_detail",
                 args=args,
-                format_text=lambda raw: self._format_detail(raw, market_name, start_date, end_date),
-                market_name=market_name,
-                start_date=start_date,
-                end_date=end_date,
+                format_text=lambda raw: self._format_detail(
+                    raw,
+                    resolved_market_name,
+                    resolved_start_date,
+                    resolved_end_date,
+                ),
+                market_name=resolved_market_name,
+                start_date=resolved_start_date,
+                end_date=resolved_end_date,
             )
+
+        state["LastMarketName"] = None
+        state["LastStartDate"] = None
+        state["LastEndDate"] = None
 
         return self.answer_with_tool(
             state,
@@ -343,14 +381,15 @@ class PowerAgent(BaseAgent):
 
 META = AgentMeta(
     agent_id="market-power-settlement",
-    version="1.0.0",
+    version="1.1.0",
     capability_tags=[
         "Market", "Power Availability for duration", "Power Availability per market", "power", "report",
-        "power settlement",
+        "power settlement", "follow-up",
     ],
     description=(
         "Power percentage availability for all markets (no args) as per provided duration. "
-        "Call with a specific market name and/or date range to get a formatted detail view for power availability."
+        "Call with a specific market name and/or date range to get a formatted detail view for power availability. "
+        "Supports basic follow-up questions by reusing the previous market/date filters when omitted."
     ),
     skills=[
         Skill(
@@ -377,6 +416,8 @@ META = AgentMeta(
             examples=[
                 "show me power availability for this week",
                 "show me power availability for last week for market PJM",
+                "what about ERCOT",
+                "same market for next week",
             ],
         ),
     ],
