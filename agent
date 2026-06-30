@@ -1,1 +1,397 @@
+"""webSettlement Power agent: Settlement run based on 100% availability of meter data.
 
+Routes between MCP-backed stored procedure calls for power percentage availability
+for all markets (no args) or filtered by market and date range.
+"""
+import json
+import logging
+from datetime import datetime
+from html import escape
+from typing import Union
+
+from genie.agents.base import BaseAgent
+from genie.registry import AgentMeta, FieldSpec, Skill
+from genie.application.state import AgentState
+
+logger = logging.getLogger(__name__)
+
+
+class PowerAgent(BaseAgent):
+    system_prompt = (
+        "You are a power settlement analyst summarizing power percentage availability "
+        "per market. If no data rows are returned for the requested market and/or date "
+        "range, tell the user clearly and naturally that no power availability data was "
+        "found for their request, and suggest they verify the market name or date range. "
+        "Do not invent data."
+    )
+    tool_names: list[str] = [
+        "list_power_availability",
+        "get_power_availability_detail",
+    ]
+
+    @staticmethod
+    def _unwrap_mcp(raw) -> Union[str, list, dict]:
+        if isinstance(raw, (str, list, dict)):
+            return raw
+
+        for attr in ("content", "text", "data", "result"):
+            value = getattr(raw, attr, None)
+            if value is not None:
+                if isinstance(value, list) and len(value) == 1:
+                    item = value[0]
+                    text = getattr(item, "text", None)
+                    if text is not None:
+                        return text
+                return value
+
+        return str(raw)
+
+    @staticmethod
+    def _parse_json(s) -> Union[list[dict], dict]:
+        if isinstance(s, (dict, list)):
+            return s
+
+        if not s:
+            return {}
+
+        if not isinstance(s, str):
+            s = str(s)
+
+        s = s.strip()
+        if not s:
+            return {}
+
+        try:
+            result = json.loads(s)
+            return json.loads(result) if isinstance(result, str) else result
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        decoder = json.JSONDecoder()
+        results = []
+        idx = 0
+        length = len(s)
+
+        while idx < length:
+            while idx < length and s[idx] in " \t\n\r":
+                idx += 1
+            if idx >= length:
+                break
+            try:
+                obj, offset = decoder.raw_decode(s, idx)
+                results.append(obj)
+                idx = offset
+            except json.JSONDecodeError:
+                break
+
+        if not results:
+            return {}
+        return results if len(results) > 1 else results[0]
+
+    @staticmethod
+    def _extract_error(data: Union[list, dict]) -> str | None:
+        if isinstance(data, dict):
+            return data.get("error") or None
+        return None
+
+    @staticmethod
+    def _fmt_date_yyyymmdd(value: str) -> str:
+        if not value:
+            return ""
+        s = str(value).strip()
+        try:
+            return datetime.strptime(s, "%Y%m%d").strftime("%d-%b")
+        except ValueError:
+            return escape(s)
+
+    @staticmethod
+    def _fmt_cell(value) -> str:
+        if value is None:
+            return ""
+        return escape(str(value))
+
+    @staticmethod
+    def _to_percent(value) -> float:
+        try:
+            return round(float(value or 0), 2)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _percent_color(value: float) -> str:
+        if value == 0:
+            return "#ffffff"
+        return "#ffe66d" if value < 50 else "#9dff96"
+
+    @staticmethod
+    def _percent_cell(value: float) -> str:
+        value = round(float(value or 0), 2)
+        degree = 360 * value / 100
+        color = "#ffffff" if value == 0 else ("#ffe66d" if value < 50 else "#9dff96")
+        display_value = f"{value:.2f}".rstrip("0").rstrip(".")
+
+        td_style = (
+            "padding:14px;border-right:1px solid rgba(255,255,255,.2);"
+            "border-bottom:1px solid rgba(255,255,255,.15)"
+        )
+
+        if value == 0:
+            return (
+                f"<td style='{td_style}'>"
+                "<div style='width:58px;height:58px;border-radius:50%;"
+                "border:2px solid rgba(255,255,255,.35);display:flex;align-items:center;"
+                "justify-content:center;font-size:12px;font-weight:700;color:#fff;"
+                "box-sizing:border-box;margin:auto;white-space:nowrap'>0%</div>"
+                "</td>"
+            )
+
+        if value >= 100:
+            return (
+                f"<td style='{td_style}'>"
+                "<div style='width:58px;height:58px;border-radius:50%;"
+                "border:2px solid #9dff96;display:flex;align-items:center;justify-content:center;"
+                "font-size:12px;font-weight:700;color:#9dff96;box-sizing:border-box;"
+                "margin:auto;white-space:nowrap'>100%</div>"
+                "</td>"
+            )
+
+        return (
+            f"<td style='{td_style}'>"
+            "<div style='width:58px;height:58px;border-radius:50%;border:2px solid rgba(255,255,255,.15);"
+            "position:relative;margin:auto;box-sizing:border-box'>"
+            f"<div style='position:absolute;inset:4px;border-radius:50%;"
+            f"background:conic-gradient({color} 0deg {degree}deg,rgba(255,255,255,.10) {degree}deg 360deg)'></div>"
+            "<div style='position:absolute;inset:8px;border-radius:50%;background:#22163b'></div>"
+            "<span style='position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);"
+            "font-size:11px;font-weight:700;line-height:1;white-space:nowrap;"
+            f"color:{color};text-align:center'>{display_value}%</span>"
+            "</div></td>"
+        )
+
+    @staticmethod
+    def _get_headers(headers: list[str]) -> str:
+        header_template = (
+            "<th style='padding:12px;border-right:1px solid rgba(255,255,255,0.25);"
+            "border-bottom:2px solid rgba(255,255,255,0.25);'>{0}</th>"
+        )
+        parts = [header_template.format("Market")]
+        for header in headers:
+            parts.append(header_template.format(PowerAgent._fmt_date_yyyymmdd(header)))
+        return "".join(parts)
+
+    @staticmethod
+    def _get_row(market: str, percentage_by_date: dict[str, float]) -> str:
+        parts = ["<tr>"]
+        parts.append(
+            "<td style='padding:14px;border-right:1px solid rgba(255,255,255,0.2);"
+            "border-bottom:1px solid rgba(255,255,255,0.15);font-weight:700;'>"
+            f"{PowerAgent._fmt_cell(market)}</td>"
+        )
+
+        for _, value in percentage_by_date.items():
+            parts.append(PowerAgent._percent_cell(value))
+
+        parts.append("</tr>")
+        return "".join(parts)
+
+    @staticmethod
+    def _build_market_html(data: list[dict], info: str) -> str:
+        date_keys = sorted(
+            {str(x.get('OperatingDate', '')).strip() for x in data if x.get("OperatingDate")}
+        )
+        markets = sorted(
+            {str(x.get('MarketName', x.get('Market', ''))).strip() for x in data if x.get('MarketName') or x.get('Market')}
+        )
+
+        headers = PowerAgent._get_headers(date_keys)
+        rows = []
+
+        for market in markets:
+            percentage_by_date: dict[str, float] = {}
+            for day in date_keys:
+                match = next(
+                    (
+                        row for row in data
+                        if str(row.get("OperatingDate", "")).strip() == day
+                        and str(row.get("MarketName", row.get("Market", ""))).strip() == market
+                    ),
+                    None,
+                )
+                percentage_by_date[day] = PowerAgent._to_percent(
+                    match.get("CompletionPercent", 0) if match else 0
+                )
+            rows.append(PowerAgent._get_row(market, percentage_by_date))
+
+        return (
+            f"{escape(info)}<br/>"
+            "<div style='width:1420px;background:#0d091e;font-family:Arial,sans-serif;"
+            "border:1px solid rgba(255,255,255,.15);border-radius:14px;padding:18px;color:#fff;box-sizing:border-box'>"
+            "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;box-sizing:border-box'>"
+            "<div style='font-size:20px;font-weight:700;box-sizing:border-box'>Data Availability by Market and Day</div>"
+            "</div>"
+            "<div style='display:flex;align-items:flex-start;gap:20px;box-sizing:border-box'>"
+            "<table style='border-collapse:collapse;width:auto;text-align:center;color:#f3f3f3;box-sizing:border-box'>"
+            f"<thead><tr>{headers}</tr></thead><tbody>{''.join(rows)}</tbody></table>"
+            "<div style='width:250px;border:1px solid rgba(255,255,255,.2);border-radius:26px;padding:22px 18px;"
+            "background:rgba(255,255,255,.03);margin-top:0'>"
+            "<div style='display:flex;align-items:center;gap:14px;margin-bottom:18px'>"
+            "<div style='width:52px;height:52px;border-radius:50%;border:2px solid rgba(255,255,255,.35);display:flex;"
+            "align-items:center;justify-content:center;font-size:12px;font-weight:700;box-sizing:border-box'>0%</div>"
+            "<div style='font-size:14px;font-weight:600'>= 0% Available</div></div>"
+            "<div style='display:flex;align-items:center;gap:14px;margin-bottom:18px'>"
+            "<div style='width:52px;height:52px;border-radius:50%;border:2px solid rgba(255,255,255,.15);position:relative'>"
+            "<div style='position:absolute;inset:4px;border-radius:50%;background:conic-gradient(#ffe66d 0deg 144deg,rgba(255,255,255,.08) 144deg 360deg)'></div>"
+            "<div style='position:absolute;inset:8px;border-radius:50%;background:#22163b'></div>"
+            "<span style='position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#ffe66d;font-size:12px;font-weight:700'>40%</span>"
+            "</div><div style='font-size:14px;font-weight:600'>= Intermediate Data</div></div>"
+            "<div style='display:flex;align-items:center;gap:14px;margin-bottom:18px'>"
+            "<div style='width:52px;height:52px;border-radius:50%;border:2px solid rgba(255,255,255,.15);position:relative'>"
+            "<div style='position:absolute;inset:4px;border-radius:50%;background:conic-gradient(#9dff96 0deg 313deg,rgba(255,255,255,.08) 313deg 360deg)'></div>"
+            "<div style='position:absolute;inset:8px;border-radius:50%;background:#22163b'></div>"
+            "<span style='position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#9dff96;font-size:12px;font-weight:700'>87%</span>"
+            "</div><div style='font-size:14px;font-weight:600'>= Intermediate Data</div></div>"
+            "<div style='display:flex;align-items:center;gap:14px;margin-bottom:18px'>"
+            "<div style='width:52px;height:52px;border-radius:50%;border:2px solid #9dff96;display:flex;align-items:center;"
+            "justify-content:center;font-size:12px;font-weight:700;color:#9dff96;box-sizing:border-box'>100%</div>"
+            "<div style='font-size:14px;font-weight:600'>= 100% Available</div></div>"
+            "</div></div></div>"
+        )
+
+    @staticmethod
+    def _normalize_rows(data) -> list[dict]:
+        """Always return a list of row dicts."""
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        if isinstance(data, dict):
+            if "error" in data and len(data) <= 2:
+                return []
+            return [data]
+        return []
+
+    @staticmethod
+    def _format_list(raw) -> str | None:
+        data = PowerAgent._parse_json(PowerAgent._unwrap_mcp(raw))
+        logger.error("list_power_availability parsed=%r", data)
+
+        error = PowerAgent._extract_error(data)
+        if error:
+            return f"Could not retrieve power availability data: {escape(error)}"
+
+        items = PowerAgent._normalize_rows(data)
+        if not items:
+            return None
+
+        return PowerAgent._build_market_html(items, "Power availability for all markets")
+
+    @staticmethod
+    def _format_detail(raw, market_name: str | None, start_date: str | None, end_date: str | None) -> str | None:
+        data = PowerAgent._parse_json(PowerAgent._unwrap_mcp(raw))
+        logger.error("get_power_availability_detail parsed=%r", data)
+
+        error = PowerAgent._extract_error(data)
+        if error:
+            return (
+                f"Could not retrieve power availability"
+                f"{f' for market {escape(str(market_name))}' if market_name else ''}"
+                f"{f' from {escape(str(start_date))} to {escape(str(end_date))}' if start_date else ''}"
+                f": {escape(error)}"
+            )
+
+        rows = PowerAgent._normalize_rows(data)
+        if not rows:
+            return None
+
+        label = "Power availability"
+        if market_name:
+            label += f" for {market_name}"
+        if start_date and end_date:
+            label += f" from {start_date} to {end_date}"
+
+        return PowerAgent._build_market_html(rows, label)
+
+    def run(self, state: AgentState) -> AgentState:
+        market_name = state.get("MarketName")
+        start_date = state.get("StartDate")
+        end_date = state.get("EndDate")
+
+        if market_name or start_date or end_date:
+            args = {}
+            if market_name:
+                args["MarketName"] = market_name
+            if start_date:
+                args["StartDate"] = start_date
+            if end_date:
+                args["EndDate"] = end_date
+
+            return self.answer_with_tool(
+                state,
+                tool_name="get_power_availability_detail",
+                args=args,
+                format_text=lambda raw: self._format_detail(raw, market_name, start_date, end_date),
+                market_name=market_name,
+                start_date=start_date,
+                end_date=end_date,
+            )
+
+        return self.answer_with_tool(
+            state,
+            tool_name="list_power_availability",
+            args={},
+            format_text=self._format_list,
+        )
+
+
+META = AgentMeta(
+    agent_id="market-power-settlement",
+    version="1.0.0",
+    capability_tags=[
+        "Market", "Power Availability for duration", "Power Availability per market", "power", "report",
+        "power settlement",
+    ],
+    description=(
+        "Power percentage availability for all markets (no args) as per provided duration. "
+        "Call with a specific market name and/or date range to get a formatted detail view for power availability."
+    ),
+    skills=[
+        Skill(
+            id="list_power_availability",
+            name="List power availability",
+            description=(
+                "Returns power availability for all markets (MarketName, OperatingDate, TotalMeters, "
+                "MetersWithData, and CompletionPercent) from the latest report. Call with no arguments."
+            ),
+            tags=["power", "availability", "markets", "duration", "report", "list", "summary"],
+            examples=[
+                "show me power availability",
+                "show me power availability for markets",
+            ],
+        ),
+        Skill(
+            id="list_power_availability_per_market_duration",
+            name="List power availability for specific duration per market",
+            description=(
+                "Returns power availability for selected market/date filters. "
+                "Pass StartDate, EndDate, and MarketName."
+            ),
+            tags=["power", "availability", "markets", "duration", "report", "summary"],
+            examples=[
+                "show me power availability for this week",
+                "show me power availability for last week for market PJM",
+            ],
+        ),
+    ],
+    input_schema={
+        "MarketName": FieldSpec(type="string", required=False, description="Specific Market Name."),
+        "StartDate": FieldSpec(type="string", required=False, description="Start Date to get market power availability."),
+        "EndDate": FieldSpec(type="string", required=False, description="End Date to get market power availability."),
+    },
+    output_schema={
+        "text": FieldSpec(type="string", description="Formatted HTML response.", persist=True),
+    },
+    sla_ms=6000,
+)
+
+
+if __name__ == "__main__":
+    from genie.agents.server import run_agent
+    run_agent(PowerAgent, META)
